@@ -67,16 +67,26 @@ class Model3Dto2DConverter:
                 # Single mesh object
                 self.mesh = loaded
             
-            # Optionally subdivide mesh for better accuracy on curved surfaces
-            # More aggressive subdivision for better detail capture
-            if len(self.mesh.faces) < 50000:  # Increased from 10k to 50k
+            # Adaptive subdivision for better accuracy on curved surfaces
+            # Analyze mesh complexity and apply intelligent subdivision
+            complexity_score = self._analyze_mesh_complexity(self.mesh)
+            
+            # Determine subdivision strategy based on complexity
+            if complexity_score['needs_subdivision']:
                 try:
                     original_faces = len(self.mesh.faces)
-                    # Subdivide once to double the resolution
-                    self.mesh = self.mesh.subdivide()
-                    print(f"  Subdivided mesh for better accuracy: {original_faces} -> {len(self.mesh.faces)} faces")
+                    
+                    # Apply adaptive subdivision based on complexity
+                    self.mesh = self._adaptive_subdivision(
+                        self.mesh, 
+                        max_faces=80000,  # Reduced from 100k for better performance
+                        complexity_score=complexity_score
+                    )
+                    
+                    print(f"  Adaptively subdivided mesh: {original_faces} → {len(self.mesh.faces)} faces")
+                    print(f"  Complexity score: {complexity_score['score']:.2f} (curvature variance: {complexity_score['curvature_variance']:.4f})")
                 except Exception as e:
-                    print(f"  Note: Mesh subdivision skipped: {e}")
+                    print(f"  Note: Adaptive subdivision skipped: {e}")
             
             print(f"[+] Loaded model: {self.model_path.name}")
             print(f"  Vertices: {len(self.mesh.vertices)}")
@@ -127,6 +137,252 @@ class Model3Dto2DConverter:
         except Exception as e:
             raise Exception(f"Failed to load STEP file with CadQuery: {e}")
     
+    def _analyze_mesh_complexity(self, mesh):
+        """
+        Analyze mesh complexity to determine optimal subdivision and processing parameters
+        
+        Returns:
+            dict with complexity metrics and recommendations
+        """
+        try:
+            # Calculate basic metrics
+            num_faces = len(mesh.faces)
+            num_vertices = len(mesh.vertices)
+            
+            # Calculate edge lengths for detail analysis
+            edges = mesh.edges_unique
+            edge_vectors = mesh.vertices[edges[:, 1]] - mesh.vertices[edges[:, 0]]
+            edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+            
+            # Analyze edge length distribution
+            mean_edge_length = np.mean(edge_lengths)
+            std_edge_length = np.std(edge_lengths)
+            edge_length_variance = std_edge_length / (mean_edge_length + 1e-10)
+            
+            # Analyze curvature using face normals
+            face_normals = mesh.face_normals
+            
+            # Calculate normal variation (proxy for curvature)
+            # Compare each face normal with its neighbors
+            face_adjacency = mesh.face_adjacency
+            if len(face_adjacency) > 0:
+                normal_diffs = []
+                for adj in face_adjacency:
+                    n1 = face_normals[adj[0]]
+                    n2 = face_normals[adj[1]]
+                    # Angle between normals (0 = flat, π = sharp edge)
+                    dot_product = np.clip(np.dot(n1, n2), -1.0, 1.0)
+                    angle = np.arccos(dot_product)
+                    normal_diffs.append(angle)
+                
+                curvature_variance = np.std(normal_diffs)
+                mean_curvature = np.mean(normal_diffs)
+            else:
+                curvature_variance = 0.0
+                mean_curvature = 0.0
+            
+            # Calculate complexity score (0-1 scale)
+            # Higher score = more complex geometry requiring more subdivision
+            complexity_factors = [
+                min(1.0, edge_length_variance / 0.5),  # Edge length variation
+                min(1.0, curvature_variance / 0.3),     # Curvature variation
+                min(1.0, mean_curvature / 0.5),         # Average curvature
+                min(1.0, num_faces / 50000)             # Model size factor
+            ]
+            
+            complexity_score = np.mean(complexity_factors)
+            
+            # Smarter subdivision strategy - balance accuracy with performance
+            # Only subdivide if mesh is coarse AND has complexity
+            needs_subdivision = (
+                num_faces < 50000 and  # Only subdivide smaller meshes (reduced from 100k)
+                (complexity_score > 0.4 or  # Moderate complexity (increased from 0.3)
+                 curvature_variance > 0.2 or  # High curvature variation (increased from 0.15)
+                 num_faces < 3000)  # Very coarse mesh (reduced from 5000)
+            )
+            
+            # Limit to single subdivision pass for better performance
+            # Only do 2 passes for extremely coarse meshes
+            recommended_subdivisions = 2 if (num_faces < 2000 and complexity_score > 0.7) else 1
+            
+            return {
+                'score': complexity_score,
+                'num_faces': num_faces,
+                'num_vertices': num_vertices,
+                'edge_length_variance': edge_length_variance,
+                'curvature_variance': curvature_variance,
+                'mean_curvature': mean_curvature,
+                'needs_subdivision': needs_subdivision,
+                'recommended_subdivisions': recommended_subdivisions
+            }
+            
+        except Exception as e:
+            print(f"  Warning: Complexity analysis failed: {e}")
+            # Return safe defaults
+            return {
+                'score': 0.5,
+                'num_faces': len(mesh.faces),
+                'num_vertices': len(mesh.vertices),
+                'edge_length_variance': 0.0,
+                'curvature_variance': 0.0,
+                'mean_curvature': 0.0,
+                'needs_subdivision': len(mesh.faces) < 50000,
+                'recommended_subdivisions': 1
+            }
+    
+    def _adaptive_subdivision(self, mesh, max_faces=80000, complexity_score=None):
+        """
+        Adaptively subdivide mesh based on local curvature and complexity
+        
+        Args:
+            mesh: Input mesh
+            max_faces: Maximum number of faces after subdivision (reduced from 100k for performance)
+            complexity_score: Pre-computed complexity metrics
+            
+        Returns:
+            Subdivided mesh
+        """
+        try:
+            if complexity_score is None:
+                complexity_score = self._analyze_mesh_complexity(mesh)
+            
+            num_subdivisions = complexity_score['recommended_subdivisions']
+            current_mesh = mesh.copy()
+            
+            # Safety check: don't subdivide if it would create too many faces
+            estimated_faces = len(current_mesh.faces) * (4 ** num_subdivisions)
+            if estimated_faces > max_faces:
+                print(f"  Skipping subdivision: would create {estimated_faces} faces (max: {max_faces})")
+                return mesh
+            
+            # Progressive subdivision with decreasing aggressiveness
+            for i in range(num_subdivisions):
+                if len(current_mesh.faces) >= max_faces:
+                    break
+                
+                # Standard subdivision (quadruples face count)
+                current_mesh = current_mesh.subdivide()
+                
+                # If we're over the limit after subdivision, return original
+                if len(current_mesh.faces) > max_faces:
+                    print(f"  Subdivision exceeded limit ({len(current_mesh.faces)} > {max_faces}), using original mesh")
+                    return mesh
+            
+            return current_mesh
+            
+        except Exception as e:
+            print(f"  Warning: Adaptive subdivision failed: {e}")
+            # Fallback to simple subdivision only for very coarse meshes
+            try:
+                if len(mesh.faces) < max_faces // 4:
+                    return mesh.subdivide()
+            except:
+                pass
+            return mesh
+    
+    def _detect_feature_points(self, mesh, view_direction):
+        """
+        Detect important feature points (corners, ridges, valleys)
+        
+        Args:
+            mesh: Input mesh
+            view_direction: View direction vector
+            
+        Returns:
+            dict with feature points and their importance scores
+        """
+        try:
+            vertices = mesh.vertices
+            face_normals = mesh.face_normals
+            
+            # Find vertices with high curvature (corners, ridges)
+            vertex_normals = mesh.vertex_normals
+            
+            # Calculate curvature at each vertex by analyzing normal variation
+            feature_scores = np.zeros(len(vertices))
+            
+            # Get vertex faces for neighborhood analysis
+            vertex_faces = mesh.vertex_faces
+            
+            for i, faces_idx in enumerate(vertex_faces):
+                # Filter out invalid face indices
+                valid_faces = faces_idx[faces_idx != -1]
+                
+                if len(valid_faces) < 2:
+                    continue
+                
+                # Get normals of adjacent faces
+                adjacent_normals = face_normals[valid_faces]
+                
+                # Calculate normal variation (higher = sharper feature)
+                normal_variance = np.std([np.dot(vertex_normals[i], n) for n in adjacent_normals])
+                
+                # Calculate visibility from view direction
+                visibility = abs(np.dot(vertex_normals[i], view_direction))
+                
+                # Combined feature score
+                feature_scores[i] = normal_variance * visibility
+            
+            # Identify top feature points
+            threshold = np.percentile(feature_scores, 85)  # Top 15% of features
+            feature_indices = np.where(feature_scores > threshold)[0]
+            
+            return {
+                'indices': feature_indices,
+                'scores': feature_scores[feature_indices],
+                'positions': vertices[feature_indices]
+            }
+            
+        except Exception as e:
+            print(f"  Warning: Feature detection failed: {e}")
+            return {'indices': np.array([]), 'scores': np.array([]), 'positions': np.array([])}
+    
+    def _calculate_edge_importance(self, edge_props, mesh, view_dir):
+        """
+        Calculate importance score for an edge based on multiple criteria
+        
+        Args:
+            edge_props: Dictionary with edge properties
+            mesh: Input mesh
+            view_dir: View direction vector
+            
+        Returns:
+            Importance score (0-1)
+        """
+        try:
+            # Criteria weights
+            angle_weight = 0.3
+            visibility_weight = 0.25
+            length_weight = 0.15
+            curvature_weight = 0.3
+            
+            # Normalize angle (0-π → 0-1)
+            angle_score = edge_props['angle'] / np.pi
+            
+            # Visibility score (how visible is this edge)
+            visibility_score = max(abs(edge_props['dot1']), abs(edge_props['dot2']))
+            
+            # Length score (longer edges are more important)
+            # Normalize by mesh scale
+            mesh_scale = np.max(mesh.extents)
+            length_score = min(1.0, edge_props['length'] / (mesh_scale * 0.1))
+            
+            # Curvature score (difference in face orientations)
+            curvature_score = abs(edge_props['dot1'] - edge_props['dot2'])
+            
+            # Combined weighted score
+            importance = (
+                angle_weight * angle_score +
+                visibility_weight * visibility_score +
+                length_weight * length_score +
+                curvature_weight * curvature_score
+            )
+            
+            return min(1.0, importance)
+            
+        except Exception as e:
+            return 0.5  # Default medium importance
+    
     def get_projection(self, view='front'):
         """
         Get 2D projection of the mesh from specified view with enhanced accuracy
@@ -137,42 +393,42 @@ class Model3Dto2DConverter:
         Returns:
             Path2D or Path3D object containing the projected outline
         """
-        # Ultra-high accuracy view definitions - very aggressive feature detection
+        # Enhanced accuracy view definitions - ultra-aggressive feature detection
         # Standard 6 orthographic views + isometric
         view_params = {
             'front': {  # Looking along +Z axis (XY plane)
                 'rotation': np.eye(4),
-                'edge_angle': 10.0,
-                'feature_scale': 1.5,
-                'silhouette_threshold': 0.01,
-                'min_edge_length': 0.0005
+                'edge_angle': 5.0,  # More sensitive (was 10.0)
+                'feature_scale': 2.5,  # Increased (was 1.5)
+                'silhouette_threshold': 0.002,  # Much more sensitive (was 0.01)
+                'min_edge_length': 0.00005  # Preserve tiny details (was 0.0005)
             },
             'back': {  # Looking along -Z axis
                 'rotation': trimesh.transformations.rotation_matrix(
                     np.radians(180), [0, 1, 0]
                 ),
-                'edge_angle': 10.0,
-                'feature_scale': 1.5,
-                'silhouette_threshold': 0.01,
-                'min_edge_length': 0.0005
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005
             },
             'top': {  # Looking down along -Y axis (XZ plane)
                 'rotation': trimesh.transformations.rotation_matrix(
                     np.radians(90), [1, 0, 0]
                 ),
-                'edge_angle': 1.0,  # Ultra-sensitive (was 10.0)
-                'feature_scale': 2.0, # Boost features (was 1.5)
-                'silhouette_threshold': 0.005, # More sensitive (was 0.01)
-                'min_edge_length': 0.0001 # Keep tiny details (was 0.0005)
+                'edge_angle': 3.0,  # Ultra-sensitive (was 1.0)
+                'feature_scale': 3.0,  # Maximum boost (was 2.0)
+                'silhouette_threshold': 0.001,  # Extremely sensitive (was 0.005)
+                'min_edge_length': 0.00003  # Keep tiniest details (was 0.0001)
             },
             'bottom': {  # Looking up along +Y axis
                 'rotation': trimesh.transformations.rotation_matrix(
                     np.radians(-90), [1, 0, 0]
                 ),
-                'edge_angle': 10.0,
-                'feature_scale': 1.5,
-                'silhouette_threshold': 0.01,
-                'min_edge_length': 0.0005
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005
             },
             'right': {  # Looking along +X axis (YZ plane)
                 # Rotate 90 degrees around Z to make it horizontal like the reference image
@@ -181,28 +437,28 @@ class Model3Dto2DConverter:
                 ) @ trimesh.transformations.rotation_matrix(
                     np.radians(-90), [0, 0, 1]
                 ),
-                'edge_angle': 1.0,  # Ultra-sensitive
-                'feature_scale': 2.0,
-                'silhouette_threshold': 0.005,
-                'min_edge_length': 0.0001
+                'edge_angle': 3.0,  # Ultra-sensitive (was 1.0)
+                'feature_scale': 3.0,  # Maximum boost (was 2.0)
+                'silhouette_threshold': 0.001,  # Extremely sensitive (was 0.005)
+                'min_edge_length': 0.00003  # Keep tiniest details (was 0.0001)
             },
             'left': {  # Looking along -X axis
                 'rotation': trimesh.transformations.rotation_matrix(
                     np.radians(-90), [0, 1, 0]
                 ),
-                'edge_angle': 10.0,
-                'feature_scale': 1.5,
-                'silhouette_threshold': 0.01,
-                'min_edge_length': 0.0005
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005
             },
             'side': {  # Alias for 'right' for backward compatibility
                 'rotation': trimesh.transformations.rotation_matrix(
                     np.radians(90), [0, 1, 0]
                 ),
-                'edge_angle': 10.0,
-                'feature_scale': 1.5,
-                'silhouette_threshold': 0.01,
-                'min_edge_length': 0.0005
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005
             },
             'isometric': {
                 'rotation': trimesh.transformations.rotation_matrix(
@@ -210,10 +466,10 @@ class Model3Dto2DConverter:
                 ) @ trimesh.transformations.rotation_matrix(
                     np.radians(45), [0, 0, 1]
                 ),
-                'edge_angle': 8.0,
-                'feature_scale': 1.6,
-                'silhouette_threshold': 0.008,
-                'min_edge_length': 0.0003
+                'edge_angle': 4.0,  # More sensitive (was 8.0)
+                'feature_scale': 2.8,  # Increased (was 1.6)
+                'silhouette_threshold': 0.003,  # More sensitive (was 0.008)
+                'min_edge_length': 0.00008  # Preserve more detail (was 0.0003)
             }
         }
         
@@ -408,30 +664,30 @@ class Model3Dto2DConverter:
                     silhouette_edges.append(prop['edge'])
                     is_silhouette = True
                 
-                # Feature edge detection (sharp angles between faces) - very aggressive
+                # Feature edge detection (sharp angles between faces) - ultra-aggressive
                 if not is_silhouette and prop['angle'] > np.radians(edge_angle):
                     # Weight by visibility and edge length
                     visibility = max(abs(dot1), abs(dot2))
                     weight = visibility * prop['length'] * feature_scale
                     
-                    # Very low threshold for maximum feature detection
-                    if weight > 0.02:  # Much more sensitive
-                        if abs(dot1 - dot2) > 0.3:  # More lenient
+                    # Ultra-low threshold for maximum feature detection
+                    if weight > 0.01:  # Even more sensitive (was 0.02)
+                        if abs(dot1 - dot2) > 0.2:  # More lenient (was 0.3)
                             silhouette_edges.append(prop['edge'])
                         else:
                             feature_edges.append(prop['edge'])
                 
-                # Detect crease edges (curvature-based) with very low threshold
-                if not is_silhouette and prop['angle'] > np.radians(edge_angle * 0.3):  # Even lower multiplier
+                # Detect crease edges (curvature-based) with ultra-low threshold
+                if not is_silhouette and prop['angle'] > np.radians(edge_angle * 0.2):  # Even lower (was 0.3)
                     # Check if this is a crease (both faces facing similar direction)
-                    # Increased tolerance from 0.4 to 0.6 to capture more curvature
-                    if dot1 * dot2 > 0 and abs(dot1 - dot2) < 0.6:  
+                    # Increased tolerance to capture more curvature
+                    if dot1 * dot2 > 0 and abs(dot1 - dot2) < 0.7:  # More lenient (was 0.6)
                         crease_edges.append(prop['edge'])
                 
                 # Hidden edge detection (both faces hidden but edge is important)
-                if not is_silhouette and dot1 < -0.1 and dot2 < -0.1:
+                if not is_silhouette and dot1 < -0.05 and dot2 < -0.05:  # More sensitive (was -0.1)
                     # Both faces facing away, but sharp edge
-                    if prop['angle'] > np.radians(edge_angle * 1.5):
+                    if prop['angle'] > np.radians(edge_angle * 1.2):  # Lower threshold (was 1.5)
                         hidden_edges.append(prop['edge'])
             
             # Combine all edge types with priority (silhouette > feature > crease > hidden)
@@ -502,22 +758,34 @@ class Model3Dto2DConverter:
                 vertices=np.array(unique_verts)
             )
             
-            # Clean up small artifacts and duplicate points with multi-pass refinement
+            # Advanced multi-pass refinement for cleaner results
             try:
-                # First pass: merge very close vertices
+                # First pass: merge very close vertices (tighter tolerance)
                 path.merge_vertices(merge_tex=True, merge_norm=True)
                 
-                # Second pass: remove duplicates
+                # Second pass: remove duplicate entities
                 path.remove_duplicate_entities()
                 
-                # Third pass: simplify while preserving features
-                # Only simplify if we have many entities
-                if len(path.entities) > 100:
+                # Third pass: adaptive simplification based on entity count
+                # More aggressive simplification for very dense paths
+                if len(path.entities) > 500:
                     try:
-                        # Gentle simplification to remove noise
+                        # Stronger simplification for very dense paths
+                        path = path.simplify_spline(smooth=0.0005)
+                    except:
+                        pass
+                elif len(path.entities) > 100:
+                    try:
+                        # Gentle simplification to remove noise while preserving features
                         path = path.simplify_spline(smooth=0.0001)
                     except:
                         pass  # Simplification not always available
+                
+                # Fourth pass: merge again after simplification
+                try:
+                    path.merge_vertices(merge_tex=True, merge_norm=True)
+                except:
+                    pass
                         
             except Exception as e:
                 print(f"  Note: Path optimization failed: {e}")
@@ -562,8 +830,9 @@ class Model3Dto2DConverter:
                     p2 = vertices_2d[simplex[(i+1)%3]]
                     edge_lengths.append(np.linalg.norm(p2 - p1))
             
-            # Use 75th percentile for alpha to capture more detail
-            alpha = np.percentile(edge_lengths, 75) * 1.3  # Slightly more aggressive
+            # Use 85th percentile for alpha to capture more detail (was 75th)
+            # More aggressive for complex boundaries
+            alpha = np.percentile(edge_lengths, 85) * 1.5  # Increased multiplier from 1.3
             
             # Find boundary edges (alpha shape boundary)
             boundary_edges = []

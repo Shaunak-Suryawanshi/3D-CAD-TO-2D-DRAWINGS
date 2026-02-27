@@ -9,6 +9,8 @@ import numpy as np
 from pathlib import Path
 import argparse
 import sys
+import time
+import os
 
 
 class Model3Dto2DConverter:
@@ -23,7 +25,11 @@ class Model3Dto2DConverter:
         """
         self.model_path = Path(model_path)
         self.mesh = None
+        self._load_start = time.time()
+        self._cpu_start = time.process_time()
         self.load_model()
+        self._load_time = time.time() - self._load_start
+        print(f"  ⏱  Model load time: {self._load_time:.3f}s")
         
     def load_model(self):
         """Load the 3D model using Trimesh"""
@@ -470,6 +476,37 @@ class Model3Dto2DConverter:
                 'feature_scale': 2.8,  # Increased (was 1.6)
                 'silhouette_threshold': 0.003,  # More sensitive (was 0.008)
                 'min_edge_length': 0.00008  # Preserve more detail (was 0.0003)
+            },
+            # Section views - show internal features with center cuts
+            'section_front': {
+                'rotation': np.eye(4),
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005,
+                'is_section': True
+            },
+            'section_top': {
+                'rotation': trimesh.transformations.rotation_matrix(
+                    np.radians(90), [1, 0, 0]
+                ),
+                'edge_angle': 3.0,
+                'feature_scale': 3.0,
+                'silhouette_threshold': 0.001,
+                'min_edge_length': 0.00003,
+                'is_section': True
+            },
+            'section_side': {
+                'rotation': trimesh.transformations.rotation_matrix(
+                    np.radians(90), [0, 1, 0]
+                ) @ trimesh.transformations.rotation_matrix(
+                    np.radians(-90), [0, 0, 1]
+                ),
+                'edge_angle': 3.0,
+                'feature_scale': 3.0,
+                'silhouette_threshold': 0.001,
+                'min_edge_length': 0.00003,
+                'is_section': True
             }
         }
         
@@ -487,6 +524,15 @@ class Model3Dto2DConverter:
         
         # Apply rotation and prepare mesh
         mesh_copy.apply_transform(params['rotation'])
+        
+        # Check if this is a section view
+        is_section_view = params.get('is_section', False)
+        
+        if is_section_view:
+            # Create section view with cuts and hatching
+            # Extract the base view name (remove 'section_' prefix)
+            base_view = view.replace('section_', '') if view.startswith('section_') else view
+            return self._create_section_view(mesh_copy, base_view)
         
         # Get the 2D outline with enhanced projection
         try:
@@ -916,85 +962,240 @@ class Model3Dto2DConverter:
             except:
                 return None
     
-    def _add_section_cuts(self, mesh, view):
+    def _add_section_cuts(self, mesh, view, plane_position='center'):
         """
         Add section cuts to show internal features
-        Creates cross-sections at strategic locations
+        Creates cross-sections at the center or specified position
+        
+        Args:
+            mesh: Input mesh (already rotated to view orientation)
+            view: View name ('front', 'side', 'right', 'top', etc.)
+            plane_position: 'center' or a specific coordinate value
+            
+        Returns:
+            Path2D containing section cut edges
         """
         try:
-            # Only add sections for front and right/side views
-            if view not in ['front', 'side', 'right']:
-                return None
-            
             # Get mesh bounds
             bounds = mesh.bounds
             center = (bounds[0] + bounds[1]) / 2
             
-            # Create section planes
-            sections = []
+            # Determine section plane based on view
+            # The mesh is already rotated, so we cut perpendicular to the view direction
+            section = None
             
-            if view == 'front':
-                # Cut along Y axis (depth sections)
-                y_positions = [center[1] - bounds[1][1] * 0.2, center[1], center[1] + bounds[1][1] * 0.2]
-                for y_pos in y_positions:
-                    try:
-                        section = mesh.section(plane_origin=[0, y_pos, 0], 
-                                             plane_normal=[0, 1, 0])
-                        if section is not None:
-                            sections.append(section)
-                    except:
-                        continue
+            if view in ['front', 'back']:
+                # For front/back views, cut along Y axis (depth)
+                # This shows what's inside when looking from front
+                plane_origin = [center[0], center[1], center[2]]
+                plane_normal = [0, 1, 0]  # Cut perpendicular to Y
+                
+            elif view in ['side', 'right', 'left']:
+                # For side views, cut along X axis (width)
+                plane_origin = [center[0], center[1], center[2]]
+                plane_normal = [1, 0, 0]  # Cut perpendicular to X
+                
+            elif view in ['top', 'bottom']:
+                # For top/bottom views, cut along Z axis (height)
+                plane_origin = [center[0], center[1], center[2]]
+                plane_normal = [0, 0, 1]  # Cut perpendicular to Z
+                
+            else:
+                # For other views, try a vertical cut
+                plane_origin = [center[0], center[1], center[2]]
+                plane_normal = [0, 1, 0]
             
-            elif view in ['side', 'right']:
-                # Cut along X axis (width sections)
-                x_positions = [center[0] - bounds[1][0] * 0.2, center[0], center[0] + bounds[1][0] * 0.2]
-                for x_pos in x_positions:
-                    try:
-                        section = mesh.section(plane_origin=[x_pos, 0, 0], 
-                                             plane_normal=[1, 0, 0])
-                        if section is not None:
-                            sections.append(section)
-                    except:
-                        continue
+            # Create the section
+            section = mesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
             
-            if not sections:
+            if section is None:
                 return None
             
-            # Combine all sections into one Path2D
-            all_entities = []
-            all_vertices = []
-            vertex_offset = 0
+            # Convert section to Path2D
+            if hasattr(section, 'vertices') and len(section.vertices) > 0:
+                # Project to 2D (take X,Y coordinates)
+                vertices_2d = section.vertices[:, :2]
+                
+                # Create entities
+                entities = []
+                if hasattr(section, 'entities'):
+                    entities = section.entities
+                else:
+                    # If no entities, create lines from vertices
+                    # Assume vertices form a closed loop or multiple loops
+                    if len(vertices_2d) >= 2:
+                        # Simple line segments
+                        for i in range(len(vertices_2d) - 1):
+                            entities.append(trimesh.path.entities.Line(points=[i, i+1]))
+                
+                if not entities:
+                    return None
+                
+                # Create Path2D
+                path = trimesh.path.Path2D(
+                    entities=entities,
+                    vertices=vertices_2d
+                )
+                
+                # Mark this as a section cut for rendering purposes
+                if hasattr(path, 'metadata'):
+                    path.metadata['is_section'] = True
+                else:
+                    path.metadata = {'is_section': True}
+                
+                return path
             
-            for section in sections:
-                if hasattr(section, 'entities') and hasattr(section, 'vertices'):
-                    # Project section to 2D
-                    section_2d = section.vertices[:, :2]  # Take X,Y coordinates
-                    
-                    # Add vertices with offset
-                    all_vertices.extend(section_2d)
-                    
-                    # Add entities with adjusted indices
-                    for entity in section.entities:
-                        if hasattr(entity, 'points'):
-                            adjusted_points = entity.points + vertex_offset
-                            all_entities.append(trimesh.path.entities.Line(points=adjusted_points))
-                    
-                    vertex_offset += len(section_2d)
-            
-            if not all_entities:
-                return None
-            
-            # Create combined Path2D
-            path = trimesh.path.Path2D(
-                entities=all_entities,
-                vertices=np.array(all_vertices)
-            )
-            
-            return path
+            return None
             
         except Exception as e:
             print(f"  Note: Section cuts not available: {e}")
             return None
+    
+    def _add_section_hatching(self, section_path, bounds, spacing=None):
+        """
+        Add hatching pattern to section cuts (standard CAD practice)
+        
+        Args:
+            section_path: Path2D containing section cut edges
+            bounds: Bounding box of the section [min, max]
+            spacing: Spacing between hatch lines (auto-calculated if None)
+            
+        Returns:
+            Path2D containing hatching lines
+        """
+        try:
+            if section_path is None or not hasattr(section_path, 'vertices'):
+                return None
+            
+            # Get bounds of section
+            vertices = section_path.vertices
+            if len(vertices) == 0:
+                return None
+            
+            v_min = vertices.min(axis=0)
+            v_max = vertices.max(axis=0)
+            
+            # Calculate spacing if not provided (based on size)
+            if spacing is None:
+                size = max(v_max[0] - v_min[0], v_max[1] - v_min[1])
+                spacing = size * 0.05  # 5% of size
+            
+            # Create 45-degree hatch lines
+            hatch_entities = []
+            hatch_vertices = []
+            
+            # Determine hatch line range
+            diagonal_size = np.linalg.norm(v_max - v_min)
+            num_lines = int(diagonal_size / spacing) + 1
+            
+            # Generate hatch lines at 45 degrees
+            for i in range(num_lines):
+                # Start from bottom-left, go to top-right
+                offset = v_min[0] + v_min[1] + i * spacing
+                
+                # Line equation: y = x - offset (45 degrees)
+                # Find intersections with bounding box
+                x_start = v_min[0]
+                y_start = x_start + offset
+                
+                x_end = v_max[0]
+                y_end = x_end + offset
+                
+                # Clip to bounds
+                if y_start < v_min[1]:
+                    y_start = v_min[1]
+                    x_start = y_start - offset
+                if y_start > v_max[1]:
+                    y_start = v_max[1]
+                    x_start = y_start - offset
+                    
+                if y_end < v_min[1]:
+                    y_end = v_min[1]
+                    x_end = y_end - offset
+                if y_end > v_max[1]:
+                    y_end = v_max[1]
+                    x_end = y_end - offset
+                
+                # Check if line is within bounds
+                if x_start >= v_min[0] and x_start <= v_max[0] and \
+                   x_end >= v_min[0] and x_end <= v_max[0]:
+                    # Add hatch line
+                    idx_start = len(hatch_vertices)
+                    hatch_vertices.append([x_start, y_start])
+                    hatch_vertices.append([x_end, y_end])
+                    hatch_entities.append(trimesh.path.entities.Line(points=[idx_start, idx_start + 1]))
+            
+            if not hatch_entities:
+                return None
+            
+            # Create hatching Path2D
+            hatch_path = trimesh.path.Path2D(
+                entities=hatch_entities,
+                vertices=np.array(hatch_vertices)
+            )
+            
+            # Mark as hatching for rendering
+            hatch_path.metadata = {'is_hatching': True}
+            
+            return hatch_path
+            
+        except Exception as e:
+            print(f"  Note: Hatching generation failed: {e}")
+            return None
+    
+    def _create_section_view(self, mesh, view):
+        """
+        Create a complete section view combining silhouette and section cut
+        
+        Args:
+            mesh: Input mesh (already rotated to view orientation)
+            view: View name
+            
+        Returns:
+            Path2D containing complete section view
+        """
+        try:
+            # Get the standard projection (silhouette)
+            view_params = {
+                'rotation': np.eye(4),
+                'edge_angle': 5.0,
+                'feature_scale': 2.5,
+                'silhouette_threshold': 0.002,
+                'min_edge_length': 0.00005
+            }
+            
+            silhouette = self._extract_silhouette_edges(
+                mesh,
+                edge_angle=view_params['edge_angle'],
+                feature_scale=view_params['feature_scale'],
+                silhouette_threshold=view_params['silhouette_threshold'],
+                min_edge_length=view_params.get('min_edge_length', 0.001)
+            )
+            
+            # Get section cut
+            section = self._add_section_cuts(mesh, view)
+            
+            # Combine silhouette and section
+            if section and silhouette:
+                combined = self._combine_projections(silhouette, section)
+                
+                # Add hatching to section areas
+                if hasattr(section, 'vertices') and len(section.vertices) > 0:
+                    bounds = [section.vertices.min(axis=0), section.vertices.max(axis=0)]
+                    hatching = self._add_section_hatching(section, bounds)
+                    
+                    if hatching:
+                        # Combine with hatching
+                        combined = self._combine_projections(combined, hatching)
+                
+                return combined
+            
+            return silhouette or section
+            
+        except Exception as e:
+            print(f"  Warning: Section view creation failed: {e}")
+            return None
+
     
     def _combine_projections(self, silhouette, sections):
         """
@@ -1688,11 +1889,11 @@ class Model3Dto2DConverter:
         
     def export_to_dxf_basic(self, output_path, views=['front', 'top', 'side']):
         """
-        Export a very basic DXF for maximum compatibility (e.g., ShareCAD).
-        - DXF R12
-        - Only LINE and TEXT entities on default layer 0
-        - No custom linetypes, layers, dimensions, or centerlines
-        - Consistent scaling across all views
+        Export ultra-simple DXF for maximum compatibility (ShareCAD).
+        - DXF R2000 format (better entity support than R12)
+        - POLYLINE entities on layer 0
+        - NO text, NO custom layers, NO attributes
+        - Standard DXF structure for CAD viewers
         """
         try:
             import ezdxf
@@ -1700,11 +1901,11 @@ class Model3Dto2DConverter:
             print("[!] ezdxf not installed. Install with: pip install ezdxf")
             return
 
-        # Create R2000 DXF (more robust than R12)
+        # Create R2000 DXF - better support for polylines and modern viewers
         doc = ezdxf.new('R2000')
         msp = doc.modelspace()
 
-        # Determine grid layout
+        # Grid layout
         num_views = len(views)
         if num_views <= 2:
             grid_cols = 2
@@ -1716,7 +1917,7 @@ class Model3Dto2DConverter:
             grid_cols = 3
             grid_rows = (num_views + 2) // 3
 
-        # Precompute projections and find max extent for uniform scaling
+        # Find max extent for uniform scaling
         pre_proj = {}
         max_extent = 0.0
         for v in views:
@@ -1732,35 +1933,30 @@ class Model3Dto2DConverter:
                 max_extent = ext
 
         if max_extent <= 0:
-            # Fallback to mesh bbox
             max_extent = float(self.mesh.bounding_box.extents.max())
 
-        # Each cell size and scale factor (leave margins inside cell)
+        # Cell size and scale
         cell_size = max_extent * 2.5
-        scale = (cell_size * 0.6) / max_extent
+        scale = (cell_size * 0.6) / max_extent if max_extent > 0 else 1.0
 
-        # Start origin (top-left grid origin at 0,0)
-        start_x = 0.0
-        start_y = 0.0
+        # Track actual geometry extents for DXF header
+        global_min_x = float('inf')
+        global_min_y = float('inf')
+        global_max_x = float('-inf')
+        global_max_y = float('-inf')
+        has_geometry = False
 
-        global_min = np.array([np.inf, np.inf])
-        global_max = np.array([-np.inf, -np.inf])
-        drew_geometry = False
-
+        # Draw geometry
         for idx, v in enumerate(views):
             print(f"  Generating {v} view (basic DXF)...")
-            proj = pre_proj.get(v)
-            if proj is None:
-                proj = self.get_projection(v)
+            proj = pre_proj.get(v, self.get_projection(v))
             if proj is None or not hasattr(proj, 'vertices') or len(proj.vertices) == 0:
                 continue
 
             col = idx % grid_cols
             row = idx // grid_cols
-
-            # Center position for this cell (note: DXF Y+ is up)
-            cx = start_x + col * cell_size + cell_size / 2.0
-            cy = start_y - (row * cell_size + cell_size / 2.0)
+            cx = col * cell_size + cell_size / 2.0
+            cy = -(row * cell_size + cell_size / 2.0)
 
             verts = proj.vertices
             pmin = verts.min(axis=0)
@@ -1771,43 +1967,105 @@ class Model3Dto2DConverter:
                 for ent in proj.entities:
                     if hasattr(ent, 'points') and len(ent.points) > 0:
                         pts = verts[ent.points].copy()
-                        # center and scale
                         pts = (pts - pc) * scale
-                        # position into cell
-                        pts[:, 0] = pts[:, 0] + cx
-                        pts[:, 1] = pts[:, 1] + cy
-                        # emit polylines as sequences of LINEs
-                        for i in range(len(pts) - 1):
-                            p1 = (float(pts[i][0]), float(pts[i][1]))
-                            p2 = (float(pts[i+1][0]), float(pts[i+1][1]))
-                            # Skip zero length lines
-                            if (p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 > 1e-12:
-                                msp.add_line(p1, p2)
-
-                        if hasattr(ent, 'closed') and ent.closed and len(pts) > 2:
-                            p1 = (float(pts[-1][0]), float(pts[-1][1]))
-                            p2 = (float(pts[0][0]), float(pts[0][1]))
-                            if (p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 > 1e-12:
-                                msp.add_line(p1, p2)
-
-                        # Update global extents using the points we transformed
-                        drew_geometry = True
+                        pts[:, 0] += cx
+                        pts[:, 1] += cy
                         
-                        # Update global min/max manually to ensure correctness
-                        current_min = pts.min(axis=0)
-                        current_max = pts.max(axis=0)
+                        # Use LWPOLYLINE (lightweight polyline) - modern DXF standard
+                        # Convert to list of tuples for ezdxf
+                        point_list = [(float(pts[i][0]), float(pts[i][1])) for i in range(len(pts))]
                         
-                        # Use simple minimum logic (np.minimum works with inf)
-                        global_min = np.minimum(global_min, current_min)
-                        global_max = np.maximum(global_max, current_max)
-        
-        if drew_geometry and np.all(np.isfinite(global_min)) and np.all(np.isfinite(global_max)):
-            # Update header extents for better viewer compatibility (e.g., ShareCAD)
-            doc.header["$EXTMIN"] = (float(global_min[0]), float(global_min[1]), 0.0)
-            doc.header["$EXTMAX"] = (float(global_max[0]), float(global_max[1]), 0.0)
+                        # Filter out consecutive duplicate points
+                        filtered_points = []
+                        for i, pt in enumerate(point_list):
+                            if i == 0 or (pt[0] != filtered_points[-1][0] or pt[1] != filtered_points[-1][1]):
+                                filtered_points.append(pt)
+                        
+                        # Only add if we have at least 2 points
+                        if len(filtered_points) >= 2:
+                            # Add as LWPOLYLINE entity (R2000+ standard)
+                            is_closed = hasattr(ent, 'closed') and ent.closed
+                            try:
+                                msp.add_lwpolyline(filtered_points, close=is_closed)
+                                has_geometry = True
+                            except:
+                                # Fallback to regular polyline if LWPOLYLINE fails
+                                msp.add_polyline2d(filtered_points, close=is_closed)
+                                has_geometry = True
+                            
+                            # Update global extents
+                            for pt in filtered_points:
+                                global_min_x = min(global_min_x, pt[0])
+                                global_min_y = min(global_min_y, pt[1])
+                                global_max_x = max(global_max_x, pt[0])
+                                global_max_y = max(global_max_y, pt[1])
 
-        doc.saveas(output_path)
-        print(f"[+] Saved BASIC DXF: {output_path}")
+        # Set DXF header extents so ShareCAD knows where to look
+        if has_geometry and all(v != float('inf') and v != float('-inf') 
+                                for v in [global_min_x, global_min_y, global_max_x, global_max_y]):
+            # Add 10% padding for better visibility
+            padding_x = (global_max_x - global_min_x) * 0.1
+            padding_y = (global_max_y - global_min_y) * 0.1
+            
+            ext_min_x = global_min_x - padding_x
+            ext_min_y = global_min_y - padding_y
+            ext_max_x = global_max_x + padding_x
+            ext_max_y = global_max_y + padding_y
+            
+            # Set drawing extents (tells CAD viewer where geometry is)
+            doc.header['$EXTMIN'] = (ext_min_x, ext_min_y, 0.0)
+            doc.header['$EXTMAX'] = (ext_max_x, ext_max_y, 0.0)
+            
+            # Set drawing limits (required by some viewers)
+            doc.header['$LIMMIN'] = (ext_min_x, ext_min_y)
+            doc.header['$LIMMAX'] = (ext_max_x, ext_max_y)
+            
+            # Set insertion base point to center
+            doc.header['$INSBASE'] = ((ext_min_x + ext_max_x) / 2, (ext_min_y + ext_max_y) / 2, 0.0)
+            
+            print(f"  Drawing extents: ({ext_min_x:.2f}, {ext_min_y:.2f}) to ({ext_max_x:.2f}, {ext_max_y:.2f})")
+        else:
+            print(f"  Warning: No geometry found or invalid extents")
+
+        # Audit the DXF document for errors before saving
+        try:
+            auditor = doc.audit()
+            if auditor.has_errors:
+                print(f"  Warning: DXF has {len(auditor.errors)} errors, attempting to fix...")
+                auditor.print_error_report()
+        except:
+            pass  # Audit not critical, continue with save
+
+        # Save with explicit file writing for better compatibility
+        try:
+            import os
+            import time
+            
+            # Write DXF file with explicit encoding
+            with open(output_path, 'wt', encoding='utf-8') as f:
+                doc.write(f)
+            
+            # Verify file was written successfully
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                if file_size > 0:
+                    # Small delay to ensure file system has finished writing
+                    time.sleep(0.15)
+                    print(f"[+] Saved BASIC DXF (R2000): {output_path}")
+                    print(f"  Format: R2000 with POLYLINE entities")
+                    print(f"  File size: {file_size} bytes")
+                else:
+                    print(f"[!] Warning: DXF file created but appears empty")
+            else:
+                print(f"[!] Error: Failed to create DXF file")
+        except Exception as e:
+            print(f"[!] Error saving DXF: {e}")
+            # Fallback to saveas if write fails
+            try:
+                doc.saveas(output_path)
+                print(f"[+] Saved BASIC DXF (R2000) via fallback: {output_path}")
+            except Exception as e2:
+                print(f"[!] Fallback save also failed: {e2}")
     
     def export_to_png(self, output_path, views=['front', 'top', 'side'], 
                       resolution=(5760, 3240), line_width=3, show_dimensions=True):
@@ -2076,18 +2334,31 @@ class Model3Dto2DConverter:
             output_path: Custom output path (optional)
             views: List of views to include
         """
+        convert_start = time.time()
+        
         if output_path is None:
             output_path = self.model_path.with_suffix(f'.{output_format}')
         
         print(f"\nConverting {self.model_path.name} to {output_format.upper()}...")
         
+        # --- Projection timing ---
+        proj_start = time.time()
+        projections = {}
+        for view in views:
+            view_start = time.time()
+            projections[view] = self.get_projection(view)
+            view_elapsed = time.time() - view_start
+            print(f"  ⏱  Projection '{view}': {view_elapsed:.3f}s")
+        proj_time = time.time() - proj_start
+        
+        # --- Export timing ---
+        export_start = time.time()
+        
         fmt = output_format.lower()
         
         if fmt == 'dxf':
-            # Default DXF aims for maximum viewer compatibility (e.g., ShareCAD)
             self.export_to_dxf_basic(output_path, views)
         elif fmt == 'dxf_full':
-            # Full annotated DXF with layers/dimensions
             self.export_to_dxf(output_path, views)
         elif fmt == 'dxf_basic':
             self.export_to_dxf_basic(output_path, views)
@@ -2098,6 +2369,96 @@ class Model3Dto2DConverter:
         else:
             print(f"[!] Unsupported format: {output_format}")
             print("  Supported formats: dxf, dxf_basic, svg, png")
+            return
+        
+        export_time = time.time() - export_start
+        total_time = time.time() - convert_start
+        cpu_time = time.process_time() - self._cpu_start
+        
+        # --- Output file size ---
+        file_size = 0
+        output_file = Path(output_path)
+        if output_file.exists():
+            file_size = output_file.stat().st_size
+        
+        # --- Accuracy Metrics ---
+        total_entities = 0
+        total_proj_vertices = 0
+        total_segment_lengths = []
+        bbox_accuracy_scores = []
+        
+        # 3D model reference extents
+        model_extents = self.mesh.extents  # [width, height, depth]
+        total_mesh_edges = len(self.mesh.edges_unique)
+        
+        for view, proj in projections.items():
+            if proj is not None and hasattr(proj, 'entities') and hasattr(proj, 'vertices'):
+                total_entities += len(proj.entities)
+                total_proj_vertices += len(proj.vertices)
+                
+                # Measure segment lengths (curve resolution)
+                for entity in proj.entities:
+                    if hasattr(entity, 'points') and len(entity.points) >= 2:
+                        pts = proj.vertices[entity.points]
+                        seg_len = np.linalg.norm(pts[-1] - pts[0])
+                        if seg_len > 0:
+                            total_segment_lengths.append(seg_len)
+                
+                # Bounding box accuracy: compare 2D extents vs expected 3D footprint
+                if len(proj.vertices) > 2:
+                    proj_min = proj.vertices.min(axis=0)
+                    proj_max = proj.vertices.max(axis=0)
+                    proj_extents = proj_max - proj_min
+                    # Ratio of 2D extent to max 3D extent (ideal ≈ 1.0)
+                    model_max = max(model_extents)
+                    if model_max > 0:
+                        ratio = max(proj_extents) / model_max
+                        bbox_accuracy_scores.append(min(ratio, 1.0 / max(ratio, 1e-10)))
+        
+        # Compute accuracy scores
+        edge_detection_rate = (total_entities / max(total_mesh_edges, 1)) * 100
+        edge_detection_rate = min(edge_detection_rate, 100.0)
+        
+        avg_segment_length = np.mean(total_segment_lengths) if total_segment_lengths else 0
+        model_scale = max(model_extents) if len(model_extents) > 0 else 1.0
+        # Curve resolution: smaller segments relative to model = higher resolution
+        curve_resolution = (1.0 - min(avg_segment_length / max(model_scale, 1e-10), 1.0)) * 100 if avg_segment_length > 0 else 0
+        
+        bbox_accuracy = np.mean(bbox_accuracy_scores) * 100 if bbox_accuracy_scores else 0
+        
+        # Overall accuracy score (weighted average)
+        overall_accuracy = (
+            edge_detection_rate * 0.40 +
+            curve_resolution * 0.30 +
+            bbox_accuracy * 0.30
+        )
+        
+        # --- Performance Summary ---
+        print(f"\n{'='*55}")
+        print(f"  📊 PERFORMANCE METRICS")
+        print(f"{'='*55}")
+        print(f"  Model Load Time    : {self._load_time:.3f}s")
+        print(f"  Projection Time    : {proj_time:.3f}s  ({len(views)} views)")
+        print(f"  Export Time         : {export_time:.3f}s")
+        print(f"  Total Time          : {total_time:.3f}s")
+        print(f"  CPU Time            : {cpu_time:.3f}s")
+        if file_size > 0:
+            if file_size >= 1024 * 1024:
+                print(f"  Output File Size    : {file_size / (1024*1024):.2f} MB")
+            else:
+                print(f"  Output File Size    : {file_size / 1024:.2f} KB")
+        print(f"  Model Faces         : {len(self.mesh.faces)}")
+        print(f"  Model Vertices      : {len(self.mesh.vertices)}")
+        print(f"{'='*55}")
+        print(f"  🎯 ACCURACY METRICS")
+        print(f"{'='*55}")
+        print(f"  Edge Detection Rate : {edge_detection_rate:.1f}%  ({total_entities}/{total_mesh_edges} edges)")
+        print(f"  Entity Count        : {total_entities}  (across {len(views)} views)")
+        print(f"  Projection Vertices : {total_proj_vertices}")
+        print(f"  Curve Resolution    : {curve_resolution:.1f}%  (avg segment: {avg_segment_length:.4f})")
+        print(f"  Bounding Box Acc.   : {bbox_accuracy:.1f}%")
+        print(f"  ── Overall Accuracy : {overall_accuracy:.1f}% ──")
+        print(f"{'='*55}")
 
 
 def main():
@@ -2120,8 +2481,9 @@ Examples:
     parser.add_argument('-o', '--output', help='Output file path')
     parser.add_argument('-v', '--views', nargs='+',
                        default=['front', 'top', 'side'],
-                       choices=['front', 'back', 'left', 'right', 'top', 'bottom', 'side', 'isometric'],
-                       help='Views to include (default: front top side)')
+                       choices=['front', 'back', 'left', 'right', 'top', 'bottom', 'side', 'isometric',
+                               'section_front', 'section_top', 'section_side'],
+                       help='Views to include (default: front top side). Use section_* for section views showing internal features.')
     
     args = parser.parse_args()
     

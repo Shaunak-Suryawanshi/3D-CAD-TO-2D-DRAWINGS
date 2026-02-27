@@ -97,15 +97,28 @@ class CADConverterApp:
         # Views Selection
         ttk.Label(settings_frame, text="Views to Generate:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 5))
         
+        # Standard views
         self.var_front = tk.BooleanVar(value=True)
         self.var_top = tk.BooleanVar(value=True)
         self.var_side = tk.BooleanVar(value=True) # Right/Side
         self.var_iso = tk.BooleanVar(value=False)
         
-        ttk.Checkbutton(settings_frame, text="Front View", variable=self.var_front).pack(anchor="w")
-        ttk.Checkbutton(settings_frame, text="Top View", variable=self.var_top).pack(anchor="w")
-        ttk.Checkbutton(settings_frame, text="Right/Side View", variable=self.var_side).pack(anchor="w")
-        ttk.Checkbutton(settings_frame, text="Isometric View", variable=self.var_iso).pack(anchor="w")
+        # Section views (new)
+        self.var_section_front = tk.BooleanVar(value=False)
+        self.var_section_top = tk.BooleanVar(value=False)
+        self.var_section_side = tk.BooleanVar(value=False)
+        
+        ttk.Label(settings_frame, text="Standard Views:", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Checkbutton(settings_frame, text="Front View", variable=self.var_front).pack(anchor="w", padx=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Top View", variable=self.var_top).pack(anchor="w", padx=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Right/Side View", variable=self.var_side).pack(anchor="w", padx=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Isometric View", variable=self.var_iso).pack(anchor="w", padx=(10, 0))
+        
+        ttk.Label(settings_frame, text="Section Views:", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 2))
+        ttk.Label(settings_frame, text="(Shows internal features)", font=("Segoe UI", 7, "italic"), foreground="#666").pack(anchor="w", pady=(0, 2))
+        ttk.Checkbutton(settings_frame, text="Section Front", variable=self.var_section_front).pack(anchor="w", padx=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Section Top", variable=self.var_section_top).pack(anchor="w", padx=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Section Side", variable=self.var_section_side).pack(anchor="w", padx=(10, 0))
         
         ttk.Separator(settings_frame, orient="horizontal").pack(fill="x", pady=15)
         
@@ -175,10 +188,15 @@ class CADConverterApp:
 
     def get_selected_views(self):
         views = []
+        # Standard views
         if self.var_front.get(): views.append('front')
         if self.var_top.get(): views.append('top')
         if self.var_side.get(): views.append('side')
         if self.var_iso.get(): views.append('isometric')
+        # Section views
+        if self.var_section_front.get(): views.append('section_front')
+        if self.var_section_top.get(): views.append('section_top')
+        if self.var_section_side.get(): views.append('section_side')
         return views
 
     def generate_preview(self):
